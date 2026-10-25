@@ -1,0 +1,29 @@
+{
+  "active_platform_id": "snappshop",
+  "platforms": [
+    {
+      "id": "snappshop",
+      "name": "اسنپ شاپ",
+      "platform_fee_pct": 10.0,
+      "profit_pct": 10.0,
+      "partner_discount_pct": 0.0,
+      "site_markup_pct": 10.0,
+      "shipping_pct": 7.0,
+      "shipping_floor_toman": 30000,
+      "shipping_ceiling_toman": 190000,
+      "default_currency": "toman"
+    },
+    {
+      "id": "digikala",
+      "name": "دیجی کالا",
+      "platform_fee_pct": 10.0,
+      "profit_pct": 10.0,
+      "partner_discount_pct": 0.0,
+      "site_markup_pct": 10.0,
+      "shipping_pct": 7.0,
+      "shipping_floor_toman": 30000,
+      "shipping_ceiling_toman": 190000,
+      "default_currency": "toman"
+    }
+  ]
+}
