@@ -68,6 +68,9 @@ def _parse_number(raw: Any) -> float:
     return float(text)
 
 
+parse_number = _parse_number  # public alias (used by the UI)
+
+
 def _find_column(columns: list[str], hints: tuple[str, ...]) -> str | None:
     for col in columns:
         low = str(col).strip().lower()

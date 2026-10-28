@@ -10,12 +10,19 @@ from __future__ import annotations
 import streamlit as st
 
 from services.batch import (
+    parse_number,
     detect_base_price_column,
     process_dataframe,
     read_upload,
     to_xlsx_bytes,
 )
-from services.calculator import Currency, calculate_bundle, calculate_price, format_dual
+from services.calculator import (
+    Currency,
+    calculate_bundle,
+    calculate_price,
+    convert_amount,
+    format_amount,
+)
 from services.settings import SettingsStore
 
 st.set_page_config(
@@ -75,6 +82,30 @@ div[data-testid="stMetric"] {
     color: #0f172a;
     font-size: 1.15rem;
     font-weight: 600;
+}
+
+.breakdown-card .value.money {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: flex-start;
+    gap: 0.15rem 1rem;
+}
+
+.money-main { unicode-bidi: isolate; }
+
+.money-sub {
+    unicode-bidi: isolate;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: #64748b;
+    padding-right: 1rem;
+    border-right: 1px solid #cbd5e1;
+}
+
+.breakdown-card.highlight .money-sub {
+    color: #99f6e4;
+    border-right-color: rgba(255, 255, 255, 0.35);
 }
 
 .breakdown-card.highlight {
@@ -142,6 +173,15 @@ def platform_options(store: SettingsStore) -> dict[str, str]:
     return options
 
 
+def _format_money_input(key: str) -> None:
+    """on_change callback: rewrite the text field with thousand separators."""
+    try:
+        value = parse_number(st.session_state.get(key, ""))
+    except ValueError:
+        return  # leave invalid text as typed; the tab shows an error
+    st.session_state[key] = f"{value:,.0f}" if float(value).is_integer() else f"{value:,}"
+
+
 def render_amount_card(
     label: str,
     amount: float,
@@ -160,12 +200,17 @@ def render_amount_card(
         badge_html = f'<span class="badge {css}">{badge}</span>'
 
     cls = "breakdown-card highlight" if highlight else "breakdown-card"
-    dual = format_dual(amount, currency)
+    other: Currency = "rial" if currency == "toman" else "toman"
+    main_txt = format_amount(amount, currency)
+    sub_txt = format_amount(convert_amount(amount, currency, other), other)
     st.markdown(
         f"""
         <div class="{cls}">
             <div class="label">{label}{badge_html}</div>
-            <div class="value" dir="ltr" style="text-align:right">{dual}</div>
+            <div class="value money">
+                <span class="money-main" dir="rtl">{main_txt}</span>
+                <span class="money-sub" dir="rtl">{sub_txt}</span>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -222,17 +267,24 @@ def tab_calculator(store: SettingsStore) -> None:
         )
     currency: Currency = "toman" if currency_label == "تومان" else "rial"
 
-    base_price = st.number_input(
+    raw_price = st.text_input(
         f"قیمت لیست تولیدکننده ({currency_label})",
-        min_value=0.0,
-        value=0.0,
-        step=1000.0,
-        format="%.0f",
-        key="calc_base_price",
+        key="calc_base_price_text",
+        placeholder="مثلاً 1,020,000",
+        on_change=_format_money_input,
+        args=("calc_base_price_text",),
     )
 
-    if base_price <= 0:
+    if not raw_price.strip():
         st.info("قیمت لیست را وارد کنید تا محاسبه به‌صورت لحظه‌ای نمایش داده شود.")
+        return
+    try:
+        base_price = parse_number(raw_price)
+    except ValueError:
+        st.error("قیمت نامعتبر است. فقط عدد وارد کنید (جداکننده هزارگان مجاز است).")
+        return
+    if base_price <= 0:
+        st.info("قیمت لیست باید بیشتر از صفر باشد.")
         return
 
     try:
