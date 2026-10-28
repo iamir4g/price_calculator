@@ -15,7 +15,7 @@ from services.batch import (
     read_upload,
     to_xlsx_bytes,
 )
-from services.calculator import Currency, calculate_price, format_dual
+from services.calculator import Currency, calculate_bundle, calculate_price, format_dual
 from services.settings import SettingsStore
 
 st.set_page_config(
@@ -172,6 +172,19 @@ def render_amount_card(
     )
 
 
+def render_text_card(label: str, text: str, *, highlight: bool = False) -> None:
+    cls = "breakdown-card highlight" if highlight else "breakdown-card"
+    st.markdown(
+        f"""
+        <div class="{cls}">
+            <div class="label">{label}</div>
+            <div class="value">{text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def tab_calculator(store: SettingsStore) -> None:
     platforms = platform_options(store)
     if not platforms:
@@ -210,7 +223,7 @@ def tab_calculator(store: SettingsStore) -> None:
     currency: Currency = "toman" if currency_label == "تومان" else "rial"
 
     base_price = st.number_input(
-        f"قیمت پایه ({currency_label})",
+        f"قیمت لیست تولیدکننده ({currency_label})",
         min_value=0.0,
         value=0.0,
         step=1000.0,
@@ -219,35 +232,65 @@ def tab_calculator(store: SettingsStore) -> None:
     )
 
     if base_price <= 0:
-        st.info("قیمت پایه را وارد کنید تا محاسبه به‌صورت لحظه‌ای نمایش داده شود.")
+        st.info("قیمت لیست را وارد کنید تا محاسبه به‌صورت لحظه‌ای نمایش داده شود.")
         return
 
-    result = calculate_price(base_price, active, currency=currency)
+    try:
+        result = calculate_price(base_price, active, currency=currency)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
 
     st.subheader("تفکیک هزینه")
     left, right = st.columns(2)
 
     with left:
-        render_amount_card("قیمت پایه", result.base_price, currency)
+        render_amount_card("قیمت لیست", result.base_price, currency)
         if result.partner_discount_pct > 0:
             render_amount_card(
-                f"تخفیف همکار ({result.partner_discount_pct:g}٪)",
+                f"تخفیف خرید ({result.partner_discount_pct:g}٪)",
                 result.partner_discount_amount,
                 currency,
             )
-            render_amount_card("قیمت پایه مؤثر", result.effective_base, currency)
+        render_amount_card("قیمت خرید شما", result.effective_base, currency)
         render_amount_card(
-            f"کارمزد پلتفرم ({result.platform_fee_pct:g}٪)",
-            result.platform_fee,
+            f"سود هدف ({result.profit_pct:g}٪ از قیمت خرید)",
+            result.target_net - result.effective_base,
             currency,
         )
         render_amount_card(
-            f"سود ما ({result.profit_pct:g}٪)",
+            f"سود خالص واقعی ({result.actual_profit_pct:.1f}٪ از قیمت خرید)",
             result.profit,
+            currency,
+        )
+        render_amount_card(
+            "قیمت فروش سایت (بدون کارمزد پلتفرم)",
+            result.site_price,
             currency,
         )
 
     with right:
+        render_amount_card(
+            "قیمت فروش در پلتفرم",
+            result.sell_price,
+            currency,
+            highlight=True,
+        )
+        render_amount_card(
+            f"کمیسیون پلتفرم ({result.platform_fee_pct:g}٪ از قیمت فروش)",
+            result.platform_fee,
+            currency,
+        )
+        render_amount_card(
+            f"هزینه توسعه زیرساخت ({result.infra_fee_pct:g}٪ از قیمت فروش)",
+            result.infra_fee,
+            currency,
+        )
+        render_amount_card(
+            f"مالیات ارزش افزوده ({result.vat_pct:g}٪)",
+            result.vat_amount,
+            currency,
+        )
         render_amount_card(
             "هزینه ارسال اکسپرس تهران/کرج",
             result.shipping,
@@ -255,28 +298,76 @@ def tab_calculator(store: SettingsStore) -> None:
             badge=result.shipping_badge,
         )
         render_amount_card(
-            "قیمت فروش سایت (بدون کارمزد پلتفرم)",
-            result.site_price,
+            "مبلغ خالص دریافتی از پلتفرم",
+            result.net_received,
             currency,
         )
+
+    st.subheader("فروش باندل (چند عدد در یک سفارش)")
+    qty = st.number_input(
+        "تعداد در باندل",
+        min_value=1,
+        value=int(active.get("bundle_quantity", 3)),
+        step=1,
+        key=f"calc_bundle_qty_{platform_id}",
+    )
+    try:
+        bun = calculate_bundle(base_price, active, int(qty), currency=currency)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    b_left, b_right = st.columns(2)
+    with b_left:
         render_amount_card(
-            "هزینه / قیمت تمام‌شده پلتفرم",
-            result.total_cost,
+            f"مبلغ کل باندل ({bun.quantity} عددی)",
+            bun.bundle.sell_price,
             currency,
             highlight=True,
         )
+        render_amount_card(
+            "قیمت هر عدد در باندل",
+            bun.unit_price_in_bundle,
+            currency,
+        )
+        render_text_card(
+            "کاهش قیمت هر عدد نسبت به فروش تکی",
+            f"{bun.saving_pct:.2f}٪",
+        )
+    with b_right:
+        render_amount_card(
+            "هزینه ارسال کل باندل (یک‌بار)",
+            bun.bundle.shipping,
+            currency,
+            badge=bun.bundle.shipping_badge,
+        )
+        render_amount_card(
+            f"سود خالص باندل ({bun.bundle.actual_profit_pct:.1f}٪ از قیمت خرید)",
+            bun.bundle.profit,
+            currency,
+        )
+        if bun.min_qty_for_max_shipping > 0:
+            render_text_card(
+                "حداقل تعداد در یک سفارش برای رسیدن به سقف ارسال",
+                f"{bun.min_qty_for_max_shipping} عدد",
+            )
 
     with st.expander("جزئیات تنظیمات پلتفرم فعال"):
         st.write(
             {
                 "پلتفرم": active["name"],
-                "کارمزد": f"{active['platform_fee_pct']}%",
-                "سود": f"{active['profit_pct']}%",
-                "تخفیف همکار": f"{active['partner_discount_pct']}%",
+                "کمیسیون": f"{active['platform_fee_pct']}%",
+                "هزینه زیرساخت": f"{active.get('infra_fee_pct', 0)}%",
+                "مالیات ارزش افزوده": f"{active.get('vat_pct', 0)}%"
+                + ("" if active.get("vat_on_infra", True) else " (فقط روی کمیسیون)"),
+                "سود هدف (از قیمت خرید)": f"{active['profit_pct']}%",
+                "تخفیف خرید": f"{active['partner_discount_pct']}%",
                 "مارک‌آپ سایت": f"{active['site_markup_pct']}%",
                 "درصد ارسال": f"{active['shipping_pct']}%",
-                "کف ارسال (تومان)": f"{active['shipping_floor_toman']:,}",
-                "سقف ارسال (تومان)": f"{active['shipping_ceiling_toman']:,}",
+                "کف ارسال (تومان)": f"{active['shipping_floor_toman']:,.0f}",
+                "سقف ارسال (تومان)": f"{active['shipping_ceiling_toman']:,.0f}",
+                "گرد کردن قیمت (تومان)": f"{active.get('rounding_toman', 1000):,.0f}",
+                "تعداد پیش‌فرض باندل": f"{active.get('bundle_quantity', 3)}",
             }
         )
 
@@ -314,6 +405,14 @@ def tab_batch(store: SettingsStore) -> None:
         )
     currency: Currency = "toman" if currency_label == "تومان" else "rial"
 
+    bundle_qty = st.number_input(
+        "تعداد در باندل",
+        min_value=1,
+        value=int(platform.get("bundle_quantity", 3)),
+        step=1,
+        key=f"batch_bundle_qty_{platform['id']}",
+    )
+
     uploaded = st.file_uploader(
         "آپلود فایل CSV یا Excel",
         type=["csv", "xlsx", "xls"],
@@ -322,6 +421,10 @@ def tab_batch(store: SettingsStore) -> None:
 
     if not uploaded:
         st.caption("می‌توانید از فایل نمونه `sample_products.csv` در ریشه پروژه استفاده کنید.")
+        st.caption(
+            "اختیاری: اگر فایل ستونی با نام شامل «کمیسیون» یا «زیرساخت» (به‌صورت درصد، مثلاً 9 یا 0.6) "
+            "داشته باشد، برای هر ردیف به‌جای مقدار پیش‌فرض پلتفرم استفاده می‌شود."
+        )
         return
 
     try:
@@ -338,7 +441,7 @@ def tab_batch(store: SettingsStore) -> None:
     default_idx = col_options.index(detected) if detected in col_options else 0
 
     base_col = st.selectbox(
-        "ستون قیمت پایه",
+        "ستون قیمت لیست (پایه)",
         options=col_options,
         index=default_idx,
         key="batch_base_col",
@@ -351,6 +454,7 @@ def tab_batch(store: SettingsStore) -> None:
                 platform,
                 base_price_column=base_col,
                 currency=currency,
+                bundle_quantity=int(bundle_qty),
             )
             st.session_state.batch_result = out
             st.success("محاسبه با موفقیت انجام شد.")
@@ -425,32 +529,44 @@ def tab_settings(store: SettingsStore) -> None:
             c1, c2 = st.columns(2)
             with c1:
                 platform_fee_pct = st.number_input(
-                    "کارمزد پلتفرم (٪)",
+                    "کمیسیون پلتفرم (٪ از قیمت فروش)",
                     min_value=0.0,
                     value=float(platform["platform_fee_pct"]),
                     step=0.5,
                 )
+                infra_fee_pct = st.number_input(
+                    "هزینه توسعه زیرساخت (٪ از قیمت فروش)",
+                    min_value=0.0,
+                    value=float(platform.get("infra_fee_pct", 0.0)),
+                    step=0.1,
+                    format="%.2f",
+                )
+                vat_pct = st.number_input(
+                    "مالیات بر ارزش افزوده (٪ روی کمیسیون)",
+                    min_value=0.0,
+                    value=float(platform.get("vat_pct", 9.0)),
+                    step=0.5,
+                )
+                vat_on_infra = st.checkbox(
+                    "مالیات روی هزینه زیرساخت هم اعمال شود",
+                    value=bool(platform.get("vat_on_infra", True)),
+                )
                 profit_pct = st.number_input(
-                    "سود ما (٪)",
+                    "سود هدف (٪ نسبت به قیمت خرید)",
                     min_value=0.0,
                     value=float(platform["profit_pct"]),
                     step=0.5,
                 )
                 partner_discount_pct = st.number_input(
-                    "تخفیف همکار از قیمت پایه (٪)",
+                    "تخفیف خرید از قیمت لیست (٪)",
                     min_value=0.0,
+                    max_value=99.9,
                     value=float(platform["partner_discount_pct"]),
-                    step=0.5,
-                )
-                site_markup_pct = st.number_input(
-                    "مارک‌آپ قیمت فروش سایت (٪)",
-                    min_value=0.0,
-                    value=float(platform["site_markup_pct"]),
                     step=0.5,
                 )
             with c2:
                 shipping_pct = st.number_input(
-                    "درصد هزینه ارسال (٪)",
+                    "درصد هزینه ارسال (٪ از قیمت فروش)",
                     min_value=0.0,
                     value=float(platform["shipping_pct"]),
                     step=0.5,
@@ -469,6 +585,25 @@ def tab_settings(store: SettingsStore) -> None:
                     step=1000.0,
                     format="%.0f",
                 )
+                rounding_toman = st.number_input(
+                    "گرد کردن قیمت فروش رو به بالا (تومان)",
+                    min_value=0.0,
+                    value=float(platform.get("rounding_toman", 1000)),
+                    step=100.0,
+                    format="%.0f",
+                )
+                bundle_quantity = st.number_input(
+                    "تعداد پیش‌فرض در باندل",
+                    min_value=1,
+                    value=int(platform.get("bundle_quantity", 3)),
+                    step=1,
+                )
+                site_markup_pct = st.number_input(
+                    "مارک‌آپ قیمت فروش سایت (٪)",
+                    min_value=0.0,
+                    value=float(platform["site_markup_pct"]),
+                    step=0.5,
+                )
                 default_currency = st.selectbox(
                     "واحد پول پیش‌فرض",
                     options=["toman", "rial"],
@@ -484,12 +619,17 @@ def tab_settings(store: SettingsStore) -> None:
                             "id": selected_id,
                             "name": name.strip() or platform["name"],
                             "platform_fee_pct": platform_fee_pct,
+                            "infra_fee_pct": infra_fee_pct,
+                            "vat_pct": vat_pct,
+                            "vat_on_infra": vat_on_infra,
                             "profit_pct": profit_pct,
                             "partner_discount_pct": partner_discount_pct,
                             "site_markup_pct": site_markup_pct,
                             "shipping_pct": shipping_pct,
                             "shipping_floor_toman": shipping_floor,
                             "shipping_ceiling_toman": shipping_ceiling,
+                            "rounding_toman": rounding_toman,
+                            "bundle_quantity": int(bundle_quantity),
                             "default_currency": default_currency,
                         }
                     )
@@ -505,7 +645,7 @@ def main() -> None:
 
     st.title("ماشین‌حساب قیمت محصول")
     st.markdown(
-        '<p class="hero-sub">محاسبه کارمزد، سود، ارسال و قیمت تمام‌شده برای پلتفرم‌های مختلف — اجرای لوکال</p>',
+        '<p class="hero-sub">محاسبه قیمت فروش در پلتفرم با احتساب کمیسیون، مالیات، ارسال و سود هدف — اجرای لوکال</p>',
         unsafe_allow_html=True,
     )
 

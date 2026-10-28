@@ -18,13 +18,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "data" / "platforms.json"
 
 DEFAULT_PLATFORM_TEMPLATE: dict[str, Any] = {
-    "platform_fee_pct": 10.0,
-    "profit_pct": 10.0,
-    "partner_discount_pct": 0.0,
+    "platform_fee_pct": 9.0,  # commission, % of selling price
+    "infra_fee_pct": 0.6,  # infrastructure development fee, % of selling price
+    "vat_pct": 9.0,  # VAT charged on the commission (and infra fee if enabled)
+    "vat_on_infra": True,
+    "profit_pct": 10.0,  # target profit, % of BUY price
+    "partner_discount_pct": 0.0,  # discount off the manufacturer list price
     "site_markup_pct": 10.0,
-    "shipping_pct": 7.0,
+    "shipping_pct": 7.0,  # % of selling price, clamped by floor/ceiling
     "shipping_floor_toman": 30000,
     "shipping_ceiling_toman": 190000,
+    "rounding_toman": 1000,  # selling price is rounded UP to a multiple of this
+    "bundle_quantity": 3,  # default number of units in a bundle
     "default_currency": "toman",
 }
 
@@ -32,12 +37,17 @@ REQUIRED_FIELDS = (
     "id",
     "name",
     "platform_fee_pct",
+    "infra_fee_pct",
+    "vat_pct",
+    "vat_on_infra",
     "profit_pct",
     "partner_discount_pct",
     "site_markup_pct",
     "shipping_pct",
     "shipping_floor_toman",
     "shipping_ceiling_toman",
+    "rounding_toman",
+    "bundle_quantity",
     "default_currency",
 )
 
@@ -165,6 +175,8 @@ class SettingsStore:
 
         for key in (
             "platform_fee_pct",
+            "infra_fee_pct",
+            "vat_pct",
             "profit_pct",
             "partner_discount_pct",
             "site_markup_pct",
@@ -175,6 +187,30 @@ class SettingsStore:
                 raise ValueError(f"مقدار {key} نمی‌تواند منفی باشد.")
             payload[key] = value
 
+        rounding = float(payload["rounding_toman"])
+        if rounding < 0:
+            raise ValueError("مقدار گرد کردن نمی‌تواند منفی باشد.")
+
+        if payload["partner_discount_pct"] >= 100:
+            raise ValueError("تخفیف خرید باید کمتر از ۱۰۰٪ باشد.")
+
+        # Commission + infra fee (with VAT) + shipping % must leave something over.
+        vat = payload["vat_pct"] / 100.0
+        k = (
+            1.0
+            - payload["platform_fee_pct"] / 100.0 * (1.0 + vat)
+            - payload["infra_fee_pct"] / 100.0 * (1.0 + (vat if payload["vat_on_infra"] else 0.0))
+        )
+        if k <= 0:
+            raise ValueError("مجموع کمیسیون، هزینه زیرساخت و مالیات باید کمتر از ۱۰۰٪ باشد.")
+
+        bundle_qty = int(float(payload["bundle_quantity"]))
+        if bundle_qty < 1:
+            raise ValueError("تعداد در باندل باید حداقل ۱ باشد.")
+        payload["bundle_quantity"] = bundle_qty
+
+        payload["vat_on_infra"] = bool(payload["vat_on_infra"])
+        payload["rounding_toman"] = rounding
         payload["shipping_floor_toman"] = floor
         payload["shipping_ceiling_toman"] = ceiling
 

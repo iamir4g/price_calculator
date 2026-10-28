@@ -9,30 +9,71 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from services.calculator import Currency, calculate_price
+from services.calculator import Currency, calculate_bundle, calculate_price
 
-# Common column name candidates for base price (Persian + English)
+# Common column name candidates for base (manufacturer list) price
 BASE_PRICE_CANDIDATES = (
     "قیمت پایه",
     "قیمت_پایه",
     "قیمتپایه",
+    "قیمت لیست",
     "base_price",
     "baseprice",
+    "list_price",
     "price",
     "قیمت",
     "مبلغ",
 )
 
+# Optional per-row overrides (commission / infra fee differ between categories).
+# Values are percent numbers, e.g. 9 or 0.6 (a trailing % sign is accepted).
+FEE_COLUMN_HINTS = ("کمیسیون", "commission")
+INFRA_COLUMN_HINTS = ("زیرساخت", "infra")
+
 OUTPUT_COLUMNS = {
-    "partner_discount": "تخفیف همکار",
-    "effective_base": "قیمت پایه مؤثر",
-    "platform_fee": "کارمزد پلتفرم",
-    "profit": "سود",
+    "partner_discount": "تخفیف خرید",
+    "effective_base": "قیمت خرید",
+    "fee_pct": "درصد کمیسیون",
+    "infra_pct": "درصد زیرساخت",
+    "platform_fee": "کمیسیون پلتفرم",
+    "infra_fee": "هزینه زیرساخت",
+    "vat": "مالیات",
     "shipping": "هزینه ارسال",
     "shipping_badge": "وضعیت ارسال",
-    "total_cost": "هزینه تمام شده",
+    "sell_price": "قیمت فروش در پلتفرم",
+    "net_received": "مبلغ خالص دریافتی",
+    "profit": "سود خالص",
+    "profit_pct": "درصد سود از قیمت خرید",
     "site_price": "قیمت فروش سایت",
+    "bundle_qty": "تعداد در باندل",
+    "bundle_price": "قیمت کل باندل",
+    "bundle_unit": "قیمت هر عدد در باندل",
+    "bundle_saving": "کاهش قیمت هر عدد نسبت به تکی (٪)",
+    "bundle_shipping": "هزینه ارسال باندل",
+    "bundle_profit": "سود خالص باندل",
+    "min_qty_ship": "حداقل تعداد برای سقف ارسال",
 }
+
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _parse_number(raw: Any) -> float:
+    """Parse numbers with Persian/Arabic digits, thousand separators and % signs."""
+    if raw is None or pd.isna(raw):
+        raise ValueError("empty")
+    text = str(raw).strip().translate(_DIGITS)
+    for ch in (",", "٬", " ", "%", "٪"):
+        text = text.replace(ch, "")
+    text = text.replace("٫", ".")
+    return float(text)
+
+
+def _find_column(columns: list[str], hints: tuple[str, ...]) -> str | None:
+    for col in columns:
+        low = str(col).strip().lower()
+        if any(h in low for h in hints):
+            return col
+    return None
 
 
 def detect_base_price_column(columns: list[str]) -> str | None:
@@ -71,64 +112,95 @@ def process_dataframe(
     *,
     base_price_column: str,
     currency: Currency,
+    bundle_quantity: int | None = None,
 ) -> pd.DataFrame:
     """
     Append calculated pricing columns to a copy of ``df``.
 
     Non-numeric / empty base prices produce empty calculated cells.
+    If the file has a commission and/or infra-fee column (names containing
+    ``کمیسیون`` / ``زیرساخت``), those percentages override the platform
+    defaults row by row. ``bundle_quantity`` defaults to the platform setting.
     """
     if base_price_column not in df.columns:
         raise ValueError(f"ستون قیمت پایه یافت نشد: {base_price_column}")
 
     result = df.copy()
-    fee_label = f"کارمزد پلتفرم {settings.get('platform_fee_pct', 10):g}٪"
-    profit_label = f"سود {settings.get('profit_pct', 10):g}٪"
+    columns = [str(c) for c in result.columns]
+    fee_col = _find_column([c for c in columns if c != base_price_column], FEE_COLUMN_HINTS)
+    infra_col = _find_column([c for c in columns if c != base_price_column], INFRA_COLUMN_HINTS)
 
-    partner_vals: list[float | None] = []
-    effective_vals: list[float | None] = []
-    fee_vals: list[float | None] = []
-    profit_vals: list[float | None] = []
-    shipping_vals: list[float | None] = []
-    badge_vals: list[str | None] = []
-    total_vals: list[float | None] = []
-    site_vals: list[float | None] = []
+    keys = (
+        "partner_discount",
+        "effective_base",
+        "fee_pct",
+        "infra_pct",
+        "platform_fee",
+        "infra_fee",
+        "vat",
+        "shipping",
+        "shipping_badge",
+        "sell_price",
+        "net_received",
+        "profit",
+        "profit_pct",
+        "site_price",
+        "bundle_qty",
+        "bundle_price",
+        "bundle_unit",
+        "bundle_saving",
+        "bundle_shipping",
+        "bundle_profit",
+        "min_qty_ship",
+    )
+    out: dict[str, list[Any]] = {k: [] for k in keys}
 
-    for raw in result[base_price_column]:
+    for idx in range(len(result)):
+        row_settings = dict(settings)
         try:
-            if pd.isna(raw):
-                raise ValueError("empty")
-            # Handle Persian/Arabic digits and thousand separators
-            text = str(raw).strip()
-            text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
-            text = text.replace(",", "").replace("٬", "").replace(" ", "")
-            price = float(text)
-            breakdown = calculate_price(price, settings, currency=currency)
-            partner_vals.append(round(breakdown.partner_discount_amount))
-            effective_vals.append(round(breakdown.effective_base))
-            fee_vals.append(round(breakdown.platform_fee))
-            profit_vals.append(round(breakdown.profit))
-            shipping_vals.append(round(breakdown.shipping))
-            badge_vals.append(breakdown.shipping_badge)
-            total_vals.append(round(breakdown.total_cost))
-            site_vals.append(round(breakdown.site_price))
+            if fee_col is not None:
+                try:
+                    row_settings["platform_fee_pct"] = _parse_number(result.iloc[idx][fee_col])
+                except ValueError:
+                    pass  # empty/invalid -> platform default
+            if infra_col is not None:
+                try:
+                    row_settings["infra_fee_pct"] = _parse_number(result.iloc[idx][infra_col])
+                except ValueError:
+                    pass
+            price = _parse_number(result.iloc[idx][base_price_column])
+            bun = calculate_bundle(price, row_settings, bundle_quantity, currency=currency)
+            b = bun.single
+            values = {
+                "partner_discount": round(b.partner_discount_amount),
+                "effective_base": round(b.effective_base),
+                "fee_pct": b.platform_fee_pct,
+                "infra_pct": b.infra_fee_pct,
+                "platform_fee": round(b.platform_fee),
+                "infra_fee": round(b.infra_fee),
+                "vat": round(b.vat_amount),
+                "shipping": round(b.shipping),
+                "shipping_badge": b.shipping_badge,
+                "sell_price": round(b.sell_price),
+                "net_received": round(b.net_received),
+                "profit": round(b.profit),
+                "profit_pct": round(b.actual_profit_pct, 2),
+                "site_price": round(b.site_price),
+                "bundle_qty": bun.quantity,
+                "bundle_price": round(bun.bundle.sell_price),
+                "bundle_unit": round(bun.unit_price_in_bundle),
+                "bundle_saving": round(bun.saving_pct, 2),
+                "bundle_shipping": round(bun.bundle.shipping),
+                "bundle_profit": round(bun.bundle.profit),
+                "min_qty_ship": bun.min_qty_for_max_shipping,
+            }
         except (ValueError, TypeError):
-            partner_vals.append(None)
-            effective_vals.append(None)
-            fee_vals.append(None)
-            profit_vals.append(None)
-            shipping_vals.append(None)
-            badge_vals.append(None)
-            total_vals.append(None)
-            site_vals.append(None)
+            values = {k: None for k in keys}
+        for k in keys:
+            out[k].append(values[k])
 
-    result[OUTPUT_COLUMNS["partner_discount"]] = partner_vals
-    result[OUTPUT_COLUMNS["effective_base"]] = effective_vals
-    result[fee_label] = fee_vals
-    result[profit_label] = profit_vals
-    result[OUTPUT_COLUMNS["shipping"]] = shipping_vals
-    result[OUTPUT_COLUMNS["shipping_badge"]] = badge_vals
-    result[OUTPUT_COLUMNS["total_cost"]] = total_vals
-    result[OUTPUT_COLUMNS["site_price"]] = site_vals
+    for k in keys:
+        result[OUTPUT_COLUMNS[k]] = out[k]
     return result
 
 

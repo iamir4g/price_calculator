@@ -2,28 +2,38 @@
   "active_platform_id": "snappshop",
   "platforms": [
     {
-      "id": "snappshop",
-      "name": "اسنپ شاپ",
-      "platform_fee_pct": 10.0,
+      "platform_fee_pct": 9.0,
+      "infra_fee_pct": 0.6,
+      "vat_pct": 0.0,
+      "vat_on_infra": false,
       "profit_pct": 10.0,
-      "partner_discount_pct": 0.0,
+      "partner_discount_pct": 10.0,
       "site_markup_pct": 10.0,
       "shipping_pct": 7.0,
-      "shipping_floor_toman": 30000,
-      "shipping_ceiling_toman": 190000,
-      "default_currency": "toman"
+      "shipping_floor_toman": 30000.0,
+      "shipping_ceiling_toman": 190000.0,
+      "rounding_toman": 1000.0,
+      "bundle_quantity": 3,
+      "default_currency": "toman",
+      "id": "snappshop",
+      "name": "اسنپ شاپ"
     },
     {
-      "id": "digikala",
-      "name": "دیجی کالا",
-      "platform_fee_pct": 10.0,
+      "platform_fee_pct": 9.0,
+      "infra_fee_pct": 0.6,
+      "vat_pct": 9.0,
+      "vat_on_infra": true,
       "profit_pct": 10.0,
-      "partner_discount_pct": 0.0,
+      "partner_discount_pct": 10.0,
       "site_markup_pct": 10.0,
       "shipping_pct": 7.0,
       "shipping_floor_toman": 30000,
       "shipping_ceiling_toman": 190000,
-      "default_currency": "toman"
+      "rounding_toman": 1000,
+      "bundle_quantity": 3,
+      "default_currency": "toman",
+      "id": "digikala",
+      "name": "دیجی کالا"
     }
   ]
 }
