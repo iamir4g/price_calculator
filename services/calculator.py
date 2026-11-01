@@ -191,9 +191,14 @@ def calculate_price(
     base_price: float,
     settings: Mapping[str, Any],
     currency: Currency | None = None,
+    *,
+    fixed_sell_price: float | None = None,
 ) -> PriceBreakdown:
     """
     Calculate the selling price and full breakdown for a product.
+
+    If ``fixed_sell_price`` is given, nothing is solved: the breakdown (fees,
+    shipping, net, actual profit) is computed AT that selling price.
 
     Parameters
     ----------
@@ -215,7 +220,7 @@ def calculate_price(
     partner_discount_pct = float(settings.get("partner_discount_pct", 0))
     platform_fee_pct = float(settings.get("platform_fee_pct", 9))
     infra_fee_pct = float(settings.get("infra_fee_pct", 0.6))
-    vat_pct = float(settings.get("vat_pct", 9))
+    vat_pct = float(settings.get("vat_pct", 10))
     vat_on_infra = bool(settings.get("vat_on_infra", True))
     profit_pct = float(settings.get("profit_pct", 10))
     shipping_pct = float(settings.get("shipping_pct", 7))
@@ -234,8 +239,11 @@ def calculate_price(
     floor, ceiling = _shipping_bounds(settings, cur)
     k = 1.0 - fee_rate * (1.0 + vat_rate) - infra_rate * (1.0 + (vat_rate if vat_on_infra else 0.0))
 
-    raw_price = solve_sell_price(target_net, k, ship_rate, floor, ceiling)
-    sell_price = _round_up(raw_price, _from_toman(rounding_toman, cur))
+    if fixed_sell_price is None:
+        raw_price = solve_sell_price(target_net, k, ship_rate, floor, ceiling)
+        sell_price = _round_up(raw_price, _from_toman(rounding_toman, cur))
+    else:
+        sell_price = float(fixed_sell_price)
 
     # Re-derive every deduction from the (rounded) selling price.
     platform_fee = sell_price * fee_rate
@@ -342,3 +350,101 @@ def calculate_bundle(
         saving_pct=saving_pct,
         min_qty_for_max_shipping=min_qty,
     )
+
+
+def _round_down(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor(round(value / step, 9)) * step
+
+
+@dataclass(frozen=True)
+class CompetitiveQuote:
+    """Recommended selling price given the lowest competitor price and a profit floor."""
+
+    status: Literal["follow", "floor", "no_competitor"]
+    # follow         -> price just below the competitor (>= floor)
+    # floor          -> competitor is below your floor: stay at floor, don't chase
+    # no_competitor  -> no competitor price given: use the target-profit price
+    competitor_price: float | None
+    step: float
+    floor_profit_pct: float
+    floor: PriceBreakdown  # price at the minimum acceptable profit
+    target: PriceBreakdown  # price at the target profit (settings.profit_pct)
+    recommended: PriceBreakdown
+
+    @property
+    def recommended_price(self) -> float:
+        return self.recommended.sell_price
+
+    @property
+    def gap_to_competitor(self) -> float | None:
+        """Recommended minus competitor (negative = cheaper than the competitor)."""
+        if self.competitor_price is None:
+            return None
+        return self.recommended.sell_price - self.competitor_price
+
+
+def calculate_competitive_price(
+    base_price: float,
+    settings: Mapping[str, Any],
+    competitor_price: float | None = None,
+    *,
+    floor_profit_pct: float | None = None,
+    step: float | None = None,
+    currency: Currency | None = None,
+) -> CompetitiveQuote:
+    """
+    Price just below the competitor, but never below the profit floor.
+
+    ``floor_profit_pct`` (default ``settings['floor_profit_pct']``) is the lowest
+    profit, relative to the buy price, you accept. ``step`` (default
+    ``settings['competitor_step_toman']``, converted to the calculation currency)
+    is how far below the competitor to sit. The competitor target is rounded DOWN
+    to the platform's price grid (``rounding_toman``).
+    """
+    cur: Currency = currency or settings.get("default_currency", "toman")  # type: ignore[assignment]
+    floor_pct = float(floor_profit_pct if floor_profit_pct is not None else settings.get("floor_profit_pct", 3))
+    if floor_pct < 0:
+        raise ValueError("کف سود نمی‌تواند منفی باشد.")
+    step_cur = float(step) if step is not None else _from_toman(float(settings.get("competitor_step_toman", 1000)), cur)
+    grid = _from_toman(float(settings.get("rounding_toman", 1000)), cur)
+
+    target = calculate_price(base_price, settings, currency=cur)
+    floor_bd = calculate_price(base_price, {**settings, "profit_pct": floor_pct}, currency=cur)
+
+    if competitor_price is None or competitor_price <= 0:
+        return CompetitiveQuote("no_competitor", None, step_cur, floor_pct, floor_bd, target, target)
+
+    competitor_target = _round_down(competitor_price - step_cur, grid)
+    if competitor_target >= floor_bd.sell_price:
+        rec = calculate_price(base_price, settings, currency=cur, fixed_sell_price=competitor_target)
+        status = "follow"
+    else:
+        rec = floor_bd
+        status = "floor"
+    return CompetitiveQuote(status, float(competitor_price), step_cur, floor_pct, floor_bd, target, rec)
+
+
+def list_price_for_discount(
+    final_price: float,
+    discount_pct: float,
+    settings: Mapping[str, Any],
+    currency: Currency | None = None,
+) -> tuple[float, float]:
+    """
+    Price to type in the panel when a seller discount is applied.
+
+    Snappshop computes commission and shipping on the price AFTER the seller
+    discount. Given the wanted customer price ``final_price`` and a discount
+    percent, return ``(list_price, final_after_discount)`` where ``list_price`` is
+    the smallest multiple of the rounding grid whose discounted price is at least
+    ``final_price``.
+    """
+    if not 0 <= discount_pct < 100:
+        raise ValueError("درصد تخفیف باید بین ۰ و ۱۰۰ باشد.")
+    cur: Currency = currency or settings.get("default_currency", "toman")  # type: ignore[assignment]
+    grid = _from_toman(float(settings.get("rounding_toman", 1000)), cur)
+    keep = 1.0 - discount_pct / 100.0
+    list_price = _round_up(final_price / keep, grid)
+    return list_price, list_price * keep

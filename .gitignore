@@ -32,3 +32,7 @@ uploads/
 
 # Qodo / local tooling
 .qodo/
+
+# Private business data (buy prices, Snappshop settlement reports)
+data/buy_prices.json
+reports-summary*.xlsx

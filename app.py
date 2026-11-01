@@ -7,6 +7,7 @@ Run locally:
 
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
 from services.batch import (
@@ -19,9 +20,20 @@ from services.batch import (
 from services.calculator import (
     Currency,
     calculate_bundle,
+    calculate_competitive_price,
     calculate_price,
     convert_amount,
     format_amount,
+    list_price_for_discount,
+)
+from services.report import (
+    BuyPriceStore,
+    PRODUCT_COLUMNS,
+    ORDER_COLUMNS,
+    add_profit,
+    analysis_to_xlsx,
+    compare_with_settings,
+    parse_settlement_report,
 )
 from services.settings import SettingsStore
 
@@ -267,8 +279,19 @@ def tab_calculator(store: SettingsStore) -> None:
         )
     currency: Currency = "toman" if currency_label == "تومان" else "rial"
 
+    input_mode = st.radio(
+        "ورودی قیمت",
+        options=["قیمت لیست تولیدکننده", "قیمت خرید واقعی"],
+        horizontal=True,
+        key="calc_input_mode",
+        help="اگر قیمت خرید واقعی‌ات را می‌دانی، همان را وارد کن؛ در این حالت تخفیف خرید اعمال نمی‌شود.",
+    )
+    buy_mode = input_mode == "قیمت خرید واقعی"
+    # In buy-price mode no partner discount is applied on top of the entered price.
+    calc_settings = {**active, "partner_discount_pct": 0.0} if buy_mode else active
+
     raw_price = st.text_input(
-        f"قیمت لیست تولیدکننده ({currency_label})",
+        f"{input_mode} ({currency_label})",
         key="calc_base_price_text",
         placeholder="مثلاً 1,020,000",
         on_change=_format_money_input,
@@ -276,7 +299,7 @@ def tab_calculator(store: SettingsStore) -> None:
     )
 
     if not raw_price.strip():
-        st.info("قیمت لیست را وارد کنید تا محاسبه به‌صورت لحظه‌ای نمایش داده شود.")
+        st.info("قیمت را وارد کنید تا محاسبه به‌صورت لحظه‌ای نمایش داده شود.")
         return
     try:
         base_price = parse_number(raw_price)
@@ -284,11 +307,11 @@ def tab_calculator(store: SettingsStore) -> None:
         st.error("قیمت نامعتبر است. فقط عدد وارد کنید (جداکننده هزارگان مجاز است).")
         return
     if base_price <= 0:
-        st.info("قیمت لیست باید بیشتر از صفر باشد.")
+        st.info("قیمت باید بیشتر از صفر باشد.")
         return
 
     try:
-        result = calculate_price(base_price, active, currency=currency)
+        result = calculate_price(base_price, calc_settings, currency=currency)
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -297,8 +320,9 @@ def tab_calculator(store: SettingsStore) -> None:
     left, right = st.columns(2)
 
     with left:
-        render_amount_card("قیمت لیست", result.base_price, currency)
-        if result.partner_discount_pct > 0:
+        if not buy_mode:
+            render_amount_card("قیمت لیست", result.base_price, currency)
+        if not buy_mode and result.partner_discount_pct > 0:
             render_amount_card(
                 f"تخفیف خرید ({result.partner_discount_pct:g}٪)",
                 result.partner_discount_amount,
@@ -355,6 +379,152 @@ def tab_calculator(store: SettingsStore) -> None:
             currency,
         )
 
+    st.subheader("قیمت‌گذاری رقابتی")
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        raw_comp = st.text_input(
+            f"کمترین قیمت رقیب ({currency_label})",
+            key="calc_competitor_text",
+            placeholder="اختیاری، مثلاً 580,000",
+            on_change=_format_money_input,
+            args=("calc_competitor_text",),
+        )
+    with cc2:
+        floor_pct = st.number_input(
+            "کف سود (٪ از قیمت خرید)",
+            min_value=0.0,
+            value=float(active.get("floor_profit_pct", 3.0)),
+            step=0.5,
+            key=f"calc_floor_pct_{platform_id}",
+        )
+
+    competitor = None
+    if raw_comp.strip():
+        try:
+            competitor = parse_number(raw_comp)
+        except ValueError:
+            st.error("قیمت رقیب نامعتبر است. فقط عدد وارد کنید.")
+
+    try:
+        quote = calculate_competitive_price(
+            base_price, calc_settings, competitor, floor_profit_pct=floor_pct, currency=currency
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    q_left, q_right = st.columns(2)
+    with q_left:
+        render_amount_card(
+            f"قیمت کف (سود {quote.floor_profit_pct:g}٪)",
+            quote.floor.sell_price,
+            currency,
+        )
+        if competitor:
+            render_amount_card("قیمت رقیب", competitor, currency)
+    with q_right:
+        render_amount_card(
+            "قیمت پیشنهادی",
+            quote.recommended_price,
+            currency,
+            highlight=True,
+        )
+        render_amount_card(
+            f"سود خالص در قیمت پیشنهادی ({quote.recommended.actual_profit_pct:.1f}٪ از قیمت خرید)",
+            quote.recommended.profit,
+            currency,
+        )
+
+    if quote.status == "follow":
+        gap = abs(quote.gap_to_competitor or 0)
+        st.success(f"قیمت پیشنهادی {format_amount(gap, currency)} زیر رقیب است و از کف سود بالاتر می‌ماند.")
+        if quote.recommended_price > quote.target.sell_price:
+            st.info("رقیب گران‌تر از قیمت هدف شماست؛ می‌توانید بالاتر از سود هدف هم بفروشید.")
+    elif quote.status == "floor":
+        gap = quote.gap_to_competitor or 0
+        st.warning(
+            f"رقیب زیر کف سود شماست. قیمت کف پیشنهاد می‌شود که {format_amount(gap, currency)} "
+            "گران‌تر از رقیب است؛ دنبال قیمت رقیب نروید (یا کف را آگاهانه پایین بیاورید)."
+        )
+    else:
+        st.caption("قیمت رقیب را وارد کنید تا قیمت پیشنهادی نسبت به آن محاسبه شود؛ بدون آن، قیمت هدف نمایش داده می‌شود.")
+
+    st.subheader("سود در تعداد مختلف سفارش")
+    st.caption(
+        "هزینه ارسال به ازای هر سفارش (کل مبلغ سفارش) گرفته می‌شود، نه هر عدد؛ پس سود یک قیمت ثابت "
+        "با تعداد سفارش فرق می‌کند."
+    )
+    t1, t2 = st.columns(2)
+    with t1:
+        raw_check = st.text_input(
+            f"قیمت فروش هر عدد برای بررسی ({currency_label})",
+            key="calc_check_price_text",
+            placeholder="خالی = قیمت پیشنهادی",
+            on_change=_format_money_input,
+            args=("calc_check_price_text",),
+        )
+    with t2:
+        seller_discount_pct = st.number_input(
+            "تخفیف فروشنده در پنل (٪)",
+            min_value=0.0,
+            max_value=99.0,
+            value=0.0,
+            step=0.5,
+            key=f"calc_seller_discount_{platform_id}",
+        )
+
+    check_price = quote.recommended_price
+    if raw_check.strip():
+        try:
+            check_price = parse_number(raw_check)
+        except ValueError:
+            st.error("قیمت بررسی نامعتبر است.")
+    if check_price > 0:
+        if seller_discount_pct > 0:
+            try:
+                list_p, final_p = list_price_for_discount(
+                    check_price, seller_discount_pct, calc_settings, currency
+                )
+                d1, d2 = st.columns(2)
+                with d1:
+                    render_amount_card("قیمت قبل از تخفیف (در پنل بزنید)", list_p, currency)
+                with d2:
+                    render_amount_card(
+                        f"قیمت نهایی مشتری بعد از {seller_discount_pct:g}٪ تخفیف",
+                        final_p,
+                        currency,
+                    )
+                st.caption("کمیسیون، مالیات و ارسال روی قیمت نهایی (بعد از تخفیف) حساب می‌شوند؛ جدول زیر هم با همان.")
+                check_price = final_p
+            except ValueError as exc:
+                st.error(str(exc))
+
+        typical = int(calc_settings.get("bundle_quantity", 3))
+        quantities = sorted({1, 2, 3, 5, 10, typical})
+        rows = []
+        for q in quantities:
+            r_q = calculate_price(
+                base_price * q, calc_settings, currency=currency, fixed_sell_price=check_price * q
+            )
+            share = r_q.shipping / r_q.sell_price * 100 if r_q.sell_price else 0.0
+            rows.append(
+                {
+                    "تعداد در سفارش": q,
+                    "مبلغ سفارش": f"{r_q.sell_price:,.0f}",
+                    "هزینه ارسال": f"{r_q.shipping:,.0f}",
+                    "سهم ارسال از فروش ٪": f"{share:.1f}",
+                    "سود خالص سفارش": f"{r_q.profit:,.0f}",
+                    "سود هر عدد": f"{r_q.profit / q:,.0f}",
+                    "سود از قیمت خرید ٪": f"{r_q.actual_profit_pct:.1f}",
+                }
+            )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        loss_qty = [r["تعداد در سفارش"] for r in rows if float(r["سود خالص سفارش"].replace(",", "")) < 0]
+        if loss_qty:
+            st.warning(
+                "در این قیمت، سفارش‌های " + "، ".join(str(q) for q in loss_qty) + " عددی زیان‌ده‌اند."
+            )
+
     st.subheader("فروش باندل (چند عدد در یک سفارش)")
     qty = st.number_input(
         "تعداد در باندل",
@@ -364,7 +534,7 @@ def tab_calculator(store: SettingsStore) -> None:
         key=f"calc_bundle_qty_{platform_id}",
     )
     try:
-        bun = calculate_bundle(base_price, active, int(qty), currency=currency)
+        bun = calculate_bundle(base_price, calc_settings, int(qty), currency=currency)
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -420,6 +590,8 @@ def tab_calculator(store: SettingsStore) -> None:
                 "سقف ارسال (تومان)": f"{active['shipping_ceiling_toman']:,.0f}",
                 "گرد کردن قیمت (تومان)": f"{active.get('rounding_toman', 1000):,.0f}",
                 "تعداد پیش‌فرض باندل": f"{active.get('bundle_quantity', 3)}",
+                "کف سود": f"{active.get('floor_profit_pct', 3)}%",
+                "گام زیر رقیب (تومان)": f"{active.get('competitor_step_toman', 1000):,.0f}",
             }
         )
 
@@ -476,6 +648,10 @@ def tab_batch(store: SettingsStore) -> None:
         st.caption(
             "اختیاری: اگر فایل ستونی با نام شامل «کمیسیون» یا «زیرساخت» (به‌صورت درصد، مثلاً 9 یا 0.6) "
             "داشته باشد، برای هر ردیف به‌جای مقدار پیش‌فرض پلتفرم استفاده می‌شود."
+        )
+        st.caption(
+            "اختیاری: ستونی با نام شامل «رقیب» (کمترین قیمت رقیب) ستون‌های قیمت پیشنهادی و وضعیت رقابت را اضافه می‌کند. "
+            "ستونی با نام «کف حاشیه» (درصد) کف سود را برای همان ردیف عوض می‌کند."
         )
         return
 
@@ -650,6 +826,19 @@ def tab_settings(store: SettingsStore) -> None:
                     value=int(platform.get("bundle_quantity", 3)),
                     step=1,
                 )
+                floor_profit_pct = st.number_input(
+                    "کف سود در قیمت‌گذاری رقابتی (٪ از قیمت خرید)",
+                    min_value=0.0,
+                    value=float(platform.get("floor_profit_pct", 3.0)),
+                    step=0.5,
+                )
+                competitor_step = st.number_input(
+                    "گام زیر قیمت رقیب (تومان)",
+                    min_value=0.0,
+                    value=float(platform.get("competitor_step_toman", 1000)),
+                    step=100.0,
+                    format="%.0f",
+                )
                 site_markup_pct = st.number_input(
                     "مارک‌آپ قیمت فروش سایت (٪)",
                     min_value=0.0,
@@ -682,6 +871,8 @@ def tab_settings(store: SettingsStore) -> None:
                             "shipping_ceiling_toman": shipping_ceiling,
                             "rounding_toman": rounding_toman,
                             "bundle_quantity": int(bundle_quantity),
+                            "floor_profit_pct": floor_profit_pct,
+                            "competitor_step_toman": competitor_step,
                             "default_currency": default_currency,
                         }
                     )
@@ -689,6 +880,145 @@ def tab_settings(store: SettingsStore) -> None:
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
+
+
+_PCT_COLS = {"commission_pct", "infra_pct", "deduction_pct", "profit_pct", "shipping_pct"}
+_TEXT_COLS = {"title", "category", "order", "order_date", "basis_date"}
+
+
+def _display_table(df: pd.DataFrame, names: dict[str, str]) -> pd.DataFrame:
+    """Format a report table for display: thousand separators, Persian headers."""
+    out = pd.DataFrame()
+    for key, label in names.items():
+        if key not in df.columns:
+            continue
+        col = df[key]
+        if key in _TEXT_COLS:
+            out[label] = col.astype(str)
+        elif key in _PCT_COLS:
+            out[label] = col.map(lambda v: "" if pd.isna(v) else f"{v:.1f}")
+        else:
+            out[label] = col.map(lambda v: "" if pd.isna(v) else f"{v:,.0f}")
+    return out
+
+
+def tab_report(store: SettingsStore) -> None:
+    st.subheader("تحلیل گزارش تسویه اسنپ‌شاپ")
+    st.caption(
+        "گزارش تسویه (فایل reports-summary...xlsx از پنل فروشنده) را آپلود کنید تا کسورات واقعی هر کالا و "
+        "هر سفارش، و با وارد کردن قیمت خرید، سود واقعی را ببینید."
+    )
+    uploaded = st.file_uploader("آپلود گزارش تسویه (xlsx)", type=["xlsx"], key="report_upload")
+    if uploaded is None:
+        st.info("هنوز فایلی آپلود نشده است.")
+        return
+
+    try:
+        report = parse_settlement_report(uploaded.getvalue())
+    except Exception as exc:  # noqa: BLE001 - show any parsing problem to the user
+        st.error(f"خواندن گزارش ممکن نشد: {exc}")
+        return
+
+    tot = report.totals
+    deductions = tot["commission"] + tot["infra"] + tot["shipping"]
+    st.markdown(f"**دوره:** {report.period}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("جمع فروش (تومان)", f"{tot['sales']:,.0f}")
+    m2.metric(
+        "جمع کسورات (تومان)",
+        f"{deductions:,.0f}",
+        f"{deductions / tot['sales'] * 100:.1f}٪ از فروش" if tot["sales"] else None,
+        delta_color="off",
+    )
+    m3.metric("خالص دریافتی (تومان)", f"{tot['net']:,.0f}")
+    m4.metric("سفارش / عدد", f"{tot['orders']:,.0f} / {tot['units']:,.0f}")
+
+    if report.payout_reported is not None:
+        diff = report.payout_reported - tot["net"]
+        if abs(diff) < 5:
+            st.success("محاسبه این تب با «مانده طی دوره» گزارش یکی است.")
+        else:
+            st.warning(
+                f"مانده طی دوره در گزارش {report.payout_reported:,.0f} تومان است و با محاسبه این تب "
+                f"{diff:,.0f} تومان اختلاف دارد (احتمالاً موارد دیگری مثل برگشتی یا جریمه)."
+            )
+
+    if report.adjustments:
+        st.warning(
+            "این موارد در گزارش ثبت شده‌اند و در جدول‌های پایین لحاظ نشده‌اند: "
+            + "؛ ".join(f"{name} ({rows} ردیف، {amount:,.0f} تومان)" for name, rows, amount in report.adjustments)
+        )
+
+    active = store.get_active_platform()
+    if active:
+        warnings = compare_with_settings(report, active)
+        with st.expander(f"مغایرت با تنظیمات «{active['name']}» ({len(warnings)} مورد)", expanded=bool(warnings)):
+            if warnings:
+                for w in warnings:
+                    st.warning(w)
+            else:
+                st.success("نرخ‌های گزارش با تنظیمات پلتفرم فعال می‌خواند.")
+
+    # ---- buy prices -> real profit ----------------------------------------
+    st.subheader("سود واقعی")
+    st.caption("قیمت خرید هر عدد را وارد کنید (به‌صورت خودکار برای دفعه بعد قابل ذخیره است).")
+    buy_store = BuyPriceStore()
+    saved = buy_store.all()
+    buy_label = "قیمت خرید هر عدد (تومان)"
+    editor_df = pd.DataFrame(
+        {
+            "کالا": report.products["title"],
+            buy_label: report.products["title"].map(saved).astype("float64"),
+        }
+    )
+    edited = st.data_editor(
+        editor_df,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["کالا"],
+        num_rows="fixed",
+        key=f"report_buy_editor_{uploaded.name}_{uploaded.size}",
+        column_config={buy_label: st.column_config.NumberColumn(min_value=0, step=1000, format="%d")},
+    )
+    prices = {
+        title: float(value)
+        for title, value in zip(edited["کالا"], edited[buy_label])
+        if pd.notna(value) and float(value) > 0
+    }
+    if st.button("ذخیره قیمت‌های خرید", key="report_save_buy"):
+        buy_store.update(dict(zip(edited["کالا"], edited[buy_label])))
+        st.success("قیمت‌های خرید ذخیره شد.")
+
+    products = add_profit(report.products, prices)
+    known = products[products["buy_price"].notna()]
+    if not known.empty:
+        p1, p2, p3 = st.columns(3)
+        profit_total = known["profit"].sum()
+        cost_total = known["cost"].sum()
+        p1.metric("سود خالص (کالاهای دارای قیمت خرید)", f"{profit_total:,.0f}")
+        p2.metric("سود از هزینه خرید", f"{profit_total / cost_total * 100:.1f}٪" if cost_total else "-")
+        p3.metric("پوشش فروش", f"{known['sales'].sum() / tot['sales'] * 100:.0f}٪" if tot["sales"] else "-")
+        losers = known[known["profit"] < 0]
+        if not losers.empty:
+            st.error("کالاهای زیان‌ده: " + "؛ ".join(f"{r.title} ({r.profit:,.0f})" for r in losers.itertuples()))
+
+    # ---- tables ---------------------------------------------------------------
+    st.subheader("به تفکیک کالا")
+    names = dict(PRODUCT_COLUMNS)
+    if known.empty:
+        for k in ("buy_price", "cost", "profit", "profit_pct"):
+            names.pop(k, None)
+    st.dataframe(_display_table(products, names), use_container_width=True, hide_index=True)
+
+    with st.expander("به تفکیک سفارش"):
+        st.dataframe(_display_table(report.orders, ORDER_COLUMNS), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "دانلود تحلیل (xlsx)",
+        data=analysis_to_xlsx(products, report.orders),
+        file_name="settlement_analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 def main() -> None:
@@ -701,13 +1031,15 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    tab1, tab2, tab3 = st.tabs(
-        ["ماشین‌حساب تکی", "پردازش دسته‌ای (Excel/CSV)", "تنظیمات پلتفرم‌ها"]
+    tab1, tab2, tab4, tab3 = st.tabs(
+        ["ماشین‌حساب تکی", "پردازش دسته‌ای (Excel/CSV)", "تحلیل گزارش تسویه", "تنظیمات پلتفرم‌ها"]
     )
     with tab1:
         tab_calculator(store)
     with tab2:
         tab_batch(store)
+    with tab4:
+        tab_report(store)
     with tab3:
         tab_settings(store)
 

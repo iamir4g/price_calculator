@@ -20,7 +20,7 @@ DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "data" / "platforms.json"
 DEFAULT_PLATFORM_TEMPLATE: dict[str, Any] = {
     "platform_fee_pct": 9.0,  # commission, % of selling price
     "infra_fee_pct": 0.6,  # infrastructure development fee, % of selling price
-    "vat_pct": 9.0,  # VAT charged on the commission (and infra fee if enabled)
+    "vat_pct": 10.0,  # VAT charged on the commission (and infra fee if enabled)
     "vat_on_infra": True,
     "profit_pct": 10.0,  # target profit, % of BUY price
     "partner_discount_pct": 0.0,  # discount off the manufacturer list price
@@ -30,6 +30,8 @@ DEFAULT_PLATFORM_TEMPLATE: dict[str, Any] = {
     "shipping_ceiling_toman": 190000,
     "rounding_toman": 1000,  # selling price is rounded UP to a multiple of this
     "bundle_quantity": 3,  # default number of units in a bundle
+    "floor_profit_pct": 3.0,  # lowest profit (% of buy price) you accept when chasing a competitor
+    "competitor_step_toman": 1000,  # how far below the competitor price to sit
     "default_currency": "toman",
 }
 
@@ -48,6 +50,8 @@ REQUIRED_FIELDS = (
     "shipping_ceiling_toman",
     "rounding_toman",
     "bundle_quantity",
+    "floor_profit_pct",
+    "competitor_step_toman",
     "default_currency",
 )
 
@@ -181,6 +185,8 @@ class SettingsStore:
             "partner_discount_pct",
             "site_markup_pct",
             "shipping_pct",
+            "floor_profit_pct",
+            "competitor_step_toman",
         ):
             value = float(payload[key])
             if value < 0:
